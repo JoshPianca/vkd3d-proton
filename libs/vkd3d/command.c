@@ -21333,6 +21333,68 @@ static bool d3d12_command_list_register_rtas_scratch_range(
     return false;
 }
 
+/* Returns true if [va, va + size) lies entirely within a resource we know about.
+ * *out_resource is set to the resource containing va, or NULL if there is none. */
+static bool d3d12_command_list_rtas_range_is_backed(struct d3d12_command_list *list,
+        VkDeviceAddress va, VkDeviceSize size, const struct vkd3d_unique_resource **out_resource)
+{
+    const struct vkd3d_unique_resource *resource;
+
+    resource = vkd3d_va_map_deref(&list->device->memory_allocator.va_map, va);
+    *out_resource = resource;
+
+    if (!resource)
+        return false;
+
+    if (va < resource->va || va - resource->va > resource->size)
+        return false;
+
+    return size <= resource->size - (va - resource->va);
+}
+
+/* Validate the application's scratch range against the resource backing it and
+ * substitute internal scratch memory if it is not fully backed.
+ * Observed in Cyberpunk 2077 2.5, which sub-allocates BLAS build scratch from a
+ * buffer smaller than the scratch RADV requires for its largest BLAS builds.
+ * Returns false if the build must be dropped. */
+static bool d3d12_command_list_resolve_rtas_scratch(struct d3d12_command_list *list,
+        VkAccelerationStructureBuildGeometryInfoKHR *build_info, VkDeviceSize scratch_size)
+{
+    VkDeviceAddress va = build_info->scratchData.deviceAddress;
+    const struct vkd3d_unique_resource *resource;
+    struct vkd3d_scratch_allocation allocation;
+    VkDeviceSize alignment;
+
+    if (!scratch_size || d3d12_command_list_rtas_range_is_backed(list, va, scratch_size, &resource))
+        return true;
+
+    if (resource)
+    {
+        WARN("Application bug detected. RTAS scratch range [%"PRIx64", %"PRIx64") overflows its backing resource "
+                "(cookie %u, VA %"PRIx64", size %"PRIu64") by %"PRIu64" bytes. Substituting internal scratch memory.\n",
+                va, va + scratch_size, resource->cookie.index, resource->va, resource->size,
+                (va + scratch_size) - (resource->va + resource->size));
+    }
+    else
+    {
+        WARN("Application bug detected. RTAS scratch VA %"PRIx64" (%"PRIu64" bytes) is not backed by any resource. "
+                "Substituting internal scratch memory.\n", va, scratch_size);
+    }
+
+    alignment = max(list->device->device_info.acceleration_structure_properties.minAccelerationStructureScratchOffsetAlignment,
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
+
+    if (!d3d12_command_allocator_allocate_scratch_memory(list->allocator,
+            VKD3D_SCRATCH_POOL_KIND_DEVICE_STORAGE, scratch_size, alignment, ~0u, &allocation))
+    {
+        ERR("Failed to allocate %"PRIu64" bytes of internal RTAS scratch memory. Dropping build.\n", scratch_size);
+        return false;
+    }
+
+    build_info->scratchData.deviceAddress = allocation.va;
+    return true;
+}
+
 static bool d3d12_command_list_allocate_rtas_build_info(struct d3d12_command_list *list, uint32_t geometry_count,
         VkAccelerationStructureBuildGeometryInfoKHR **build_info,
         VkAccelerationStructureGeometryKHR **geometry_infos,
@@ -21724,9 +21786,11 @@ static void d3d12_command_list_build_raytracing_blas_and_tlas(struct d3d12_comma
     VkAccelerationStructureBuildSizesInfoKHR size_info;
     VkBuildAccelerationStructureFlagsKHR old_flags;
     VkBuildAccelerationStructureModeKHR old_mode;
+    const struct vkd3d_unique_resource *resource;
     uint32_t primitive_counts_scratch[64];
     enum vkd3d_rtas_kind rtas_kind;
     uint32_t *primitive_counts;
+    VkDeviceSize scratch_size;
     uint32_t geometry_count;
     bool discard = false;
 
@@ -21814,10 +21878,10 @@ static void d3d12_command_list_build_raytracing_blas_and_tlas(struct d3d12_comma
     build_info->flags = old_flags;
     build_info->mode = old_mode;
 
-    if (d3d12_command_list_register_rtas_scratch_range(
-            list, desc->ScratchAccelerationStructureData,
-            (desc->Inputs.Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE)
-                ? size_info.updateScratchSize : size_info.buildScratchSize))
+    scratch_size = (desc->Inputs.Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE)
+            ? size_info.updateScratchSize : size_info.buildScratchSize;
+
+    if (d3d12_command_list_register_rtas_scratch_range(list, desc->ScratchAccelerationStructureData, scratch_size))
     {
         /* The batch is restarted, need to rebuild. */
         d3d12_command_list_flush_rtas_barrier(list);
@@ -21825,6 +21889,20 @@ static void d3d12_command_list_build_raytracing_blas_and_tlas(struct d3d12_comma
         discard = false;
         goto end;
     }
+
+    /* Nothing we can do about a destination overflow, but make it visible in the log. */
+    if (desc->DestAccelerationStructureData && !d3d12_command_list_rtas_range_is_backed(list,
+            desc->DestAccelerationStructureData, size_info.accelerationStructureSize, &resource))
+    {
+        WARN("Application bug detected. RTAS destination range [%"PRIx64", %"PRIx64") is not fully backed by its "
+                "resource (cookie %u, VA %"PRIx64", size %"PRIu64"). Expect GPU faults.\n",
+                desc->DestAccelerationStructureData,
+                desc->DestAccelerationStructureData + size_info.accelerationStructureSize,
+                resource ? resource->cookie.index : 0, resource ? resource->va : 0, resource ? resource->size : 0);
+    }
+
+    if (!d3d12_command_list_resolve_rtas_scratch(list, build_info, scratch_size))
+        goto end;
 
 #ifdef VKD3D_ENABLE_BREADCRUMBS
     /* Immediately record the RTAS build command here so that we don't have
@@ -21835,6 +21913,11 @@ static void d3d12_command_list_build_raytracing_blas_and_tlas(struct d3d12_comma
         VKD3D_BREADCRUMB_AUX64(desc->DestAccelerationStructureData);
         VKD3D_BREADCRUMB_AUX64(desc->SourceAccelerationStructureData);
         VKD3D_BREADCRUMB_AUX64(desc->ScratchAccelerationStructureData);
+        if (build_info->scratchData.deviceAddress != desc->ScratchAccelerationStructureData)
+        {
+            VKD3D_BREADCRUMB_TAG("Scratch substituted [VA]");
+            VKD3D_BREADCRUMB_AUX64(build_info->scratchData.deviceAddress);
+        }
         VKD3D_BREADCRUMB_TAG((desc->Inputs.Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE) ?
                 "Update" : "Create");
         VKD3D_BREADCRUMB_TAG(desc->Inputs.Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL ? "Top" : "Bottom");
